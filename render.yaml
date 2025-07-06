@@ -1,10 +1,8 @@
-# ✅ render.yaml (must start with this!)
-type: blueprint
 services:
   - type: web
     name: blast-api
     env: python
-    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app
+    plan: free
     pythonVersion: 3.10
