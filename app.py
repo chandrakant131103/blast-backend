@@ -18,7 +18,7 @@ import glob
 warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": ["http://localhost:3000", "https://your-react-app.onrender.com"]}})
+CORS(app, resources={r"/api/*": {"origins": "http://localhost:3000"}})
 
 # Load pre-trained models and preprocessor
 pipelines = {
