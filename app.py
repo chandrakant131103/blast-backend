@@ -592,6 +592,10 @@ def serve_plot(filename):
         response.headers['Expires'] = '0'
         return response
     return jsonify({'error': 'Plot not found'}), 404
+@app.route('/')
+def index():
+    return 'Drill and Blast Optimization API is live.'
+
 
 if __name__ == '__main__':
     print("Loaded pre-trained models and preprocessor")
