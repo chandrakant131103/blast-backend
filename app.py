@@ -6,6 +6,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score, mean_absolute_error, ConfusionMatrixDisplay
 from sklearn.compose import ColumnTransformer
 from flask import Flask, request, jsonify, send_file
+from flask import Flask, send_from_directory
 from flask_cors import CORS
 import os
 import matplotlib.pyplot as plt
@@ -17,8 +18,8 @@ import glob
 
 warnings.filterwarnings('ignore')
 
-app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "http://localhost:3000"}})
+app = Flask(__name__, static_folder='static')
+CORS(app, resources={r"/api/*": {"origins": ["http://localhost:3000", "https://mineexcellence-frontend.netlify.app'"]}})
 
 # Load pre-trained models and preprocessor
 pipelines = {
@@ -595,7 +596,9 @@ def serve_plot(filename):
 @app.route('/')
 def index():
     return 'Drill and Blast Optimization API is live.'
-
+@app.route('/static/<path:filename>')
+def serve_static(filename):
+    return send_from_directory(app.static_folder, filename)
 
 if __name__ == '__main__':
     print("Loaded pre-trained models and preprocessor")
