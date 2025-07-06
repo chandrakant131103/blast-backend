@@ -7,7 +7,5 @@ pandas==2.0.3
 scikit-learn==1.2.2
 seaborn==0.12.2
 gunicorn==21.2.0
-
-# Add these lines to fix the Render build:
 setuptools>=65.5.0
 wheel>=0.40.0

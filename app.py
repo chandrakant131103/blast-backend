@@ -1,446 +1,598 @@
-from flask import Flask, jsonify, request, send_from_directory
-from flask_cors import CORS
+import matplotlib
+matplotlib.use('Agg')
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import r2_score, mean_absolute_error
-from sklearn.pipeline import Pipeline
+from sklearn.metrics import r2_score, mean_absolute_error, ConfusionMatrixDisplay
 from sklearn.compose import ColumnTransformer
-import matplotlib
-
-matplotlib.use('Agg')  # Use non-interactive backend
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+import os
 import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib
-import os
+import warnings
 import time
 import glob
-import warnings
 
 warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": "http://localhost:3000"}})
 
-# --- Features and Targets ---
+# Load pre-trained models and preprocessor
+pipelines = {
+    'frag_in_range': joblib.load('rf_model_frag_in_range.joblib'),
+    'frag_over_size': joblib.load('rf_model_frag_over_size.joblib'),
+    'ppv': joblib.load('rf_model_ppv.joblib')
+}
+preprocessor = joblib.load('preprocessor.joblib')
+
+# Load dataset for static plots and optimization
+data = pd.read_csv('Mine_Swamp.csv')
+data.columns = data.columns.str.strip().str.lower().str.replace(" ", "_")
+data.rename(columns={
+    'sremming_length': 'stemming_length',
+    'holedia': 'hole_diameter',
+    'hole_blasted': 'holes_blasted',
+    'avg_col_weight': 'avg_column_weight'
+}, inplace=True)
+
+# Feature engineering
 features = [
-    'burden', 'holedia', 'spacing', 'hole_depth', 'sremming_length', 'bench_height',
-    'hole_angle', 'total_rows', 'hole_blasted', 'column_charge_density',
-    'avg_column_charge_length', 'avg_col_weight', 'total_explosive_kg', 'rock_density',
+    'burden', 'hole_diameter', 'spacing', 'hole_depth', 'stemming_length', 'bench_height',
+    'hole_angle', 'total_rows', 'holes_blasted', 'column_charge_density',
+    'avg_column_charge_length', 'avg_column_weight', 'total_explosive_kg', 'rock_density',
     'burden_spacing', 'depth_to_bench', 'explosive_per_hole', 'x50', 'x80',
     'frag_out_of_range', 'drill_cost', 'explosive_cost', 'total_blast_cost', 'ppv_alert'
 ]
 targets = ['frag_in_range', 'frag_over_size', 'ppv']
 
-# --- Load and Preprocess Data ---
-try:
-    data = pd.read_csv('Mine_Swamp.csv')
-    data.columns = data.columns.str.strip().str.lower().str.replace(" ", "_")
+data['burden_spacing'] = data['burden'] * data['spacing']
+data['depth_to_bench'] = data['hole_depth'] / data['bench_height']
+data['explosive_per_hole'] = data['total_explosive_kg'] / data['holes_blasted']
 
-    # Feature engineering
-    data['burden_spacing'] = data['burden'] * data['spacing']
-    data['depth_to_bench'] = data['hole_depth'] / data['bench_height']
-    data['explosive_per_hole'] = data['total_explosive_kg'] / data['hole_blasted']
+def compute_x50(row):
+    B = row['burden']
+    S = row['spacing']
+    H = row['hole_depth']
+    Q = row['total_explosive_kg']
+    return 0 if Q == 0 else 0.2 * ((B * S * H) / (Q + 1e-10)) ** 0.8
 
+data['x50'] = data.apply(compute_x50, axis=1)
+data['x80'] = data['x50'] * (np.log(5)) ** (1 / 1.2)
+data['frag_out_of_range'] = data['frag_over_size'] + (100 - data['frag_in_range'] - data['frag_over_size'])
+data['drill_cost'] = data['hole_depth'] * data['holes_blasted'] * 150
+data['explosive_cost'] = data['total_explosive_kg'] * 100
+data['total_blast_cost'] = data['drill_cost'] + data['explosive_cost']
+GROUND_VIBRATION_LIMIT = np.log1p(5)
+data['ppv_alert'] = (data['ppv'] > GROUND_VIBRATION_LIMIT).astype(int)
+data['cost'] = data['total_explosive_kg'] * 100
+data['optimized_cost'] = data['total_explosive_kg'] * 95
+data['cost_savings'] = data['cost'] - data['optimized_cost']
 
-    def compute_x50(row):
-        B = row['burden']
-        S = row['spacing']
-        H = row['hole_depth']
-        Q = row['total_explosive_kg']
-        return 0 if Q == 0 else 0.2 * ((B * S * H) / Q) ** 0.8
+# Clean data
+data = data.replace([np.inf, -np.inf], np.nan).dropna(subset=features + targets)
+data = data[data['production_ton_therotical'] > 0]
+data['ppv'] = np.log1p(data['ppv'])
 
+# Load test indices and static plot data
+X_test_indices = joblib.load('X_test_indices.joblib')
+static_plot_data = joblib.load('static_plot_data_nw.joblib')
+results = static_plot_data['results']
+optimized_costs = static_plot_data['optimized_costs']
+optimized_frags = static_plot_data['optimized_frags']
+optimized_ppvs = static_plot_data['optimized_ppvs']
+optimized_holes = static_plot_data['optimized_holes']
 
-    data['x50'] = data.apply(compute_x50, axis=1)
-    data['x80'] = data['x50'] * (np.log(5)) ** (1 / 1.2)
-    data['frag_out_of_range'] = data['frag_over_size'] + (100 - data['frag_in_range'] - data['frag_over_size'])
-    data['drill_cost'] = data['hole_depth'] * data['hole_blasted'] * 150
-    data['explosive_cost'] = data['total_explosive_kg'] * 100
-    data['total_blast_cost'] = data['drill_cost'] + data['explosive_cost']
-    data['ppv_alert'] = (data['ppv'] > np.log1p(5)).astype(int)
-    data['cost'] = data['total_explosive_kg'] * 100
-    data['optimized_cost'] = data['total_explosive_kg'] * 95
-    data['cost_savings'] = data['cost'] - data['optimized_cost']
-    data['unsafe_blast'] = data['ppv'] > np.log1p(10)
+# Optimization functions
+FRAG_THRESHOLD = 5
 
-    # Clean data
-    data = data.replace([np.inf, -np.inf], np.nan).dropna(subset=features + targets)
-    if 'production_ton_therotical' in data.columns:
-        data = data[data['production_ton_therotical'] > 0]
-    data['ppv'] = np.log1p(data['ppv'])
-    unsafe_count = int(data['unsafe_blast'].sum())
-except FileNotFoundError:
-    print("Error: Mine_Swamp.csv not found")
-    data = pd.DataFrame()
-    unsafe_count = 0
+def optimize_cost(row, model, features, data):
+    explosive_range = np.linspace(row['total_explosive_kg'] * 0.5, row['total_explosive_kg'] * 1.5, 20)
+    holes_range = np.linspace(max(1, row['holes_blasted'] * 0.5), row['holes_blasted'] * 1.5, 10, dtype=int)
+    min_cost = float('inf')
+    best_explosive = row['total_explosive_kg']
+    best_holes = row['holes_blasted']
+    pred_frags = []
+    for explosive in explosive_range:
+        for holes in holes_range:
+            temp_row = row.copy()
+            temp_row['total_explosive_kg'] = explosive
+            temp_row['holes_blasted'] = holes
+            temp_row['explosive_cost'] = explosive * 100
+            temp_row['drill_cost'] = temp_row['hole_depth'] * holes * 150
+            temp_row['total_blast_cost'] = temp_row['drill_cost'] + temp_row['explosive_cost']
+            temp_row['explosive_per_hole'] = explosive / holes if holes > 0 else 0
+            temp_row['x50'] = compute_x50(temp_row)
+            temp_row['x80'] = temp_row['x50'] * (np.log(5)) ** (1 / 1.2)
+            pred_frag = model.predict(pd.DataFrame([temp_row[features]], columns=features))[0]
+            pred_frags.append(pred_frag)
+            if pred_frag >= FRAG_THRESHOLD and temp_row['total_blast_cost'] < min_cost:
+                min_cost = temp_row['total_blast_cost']
+                best_explosive = explosive
+                best_holes = holes
+    print(f"Index {row.name}: Cost optimization - Predicted frags: {pred_frags}")
+    if min_cost == float('inf'):
+        print(f"Warning: No solution found for cost optimization at index {row.name}")
+        min_cost = data.loc[row.name, 'total_blast_cost'] if row.name in data.index else row['total_blast_cost']
+        best_holes = row['holes_blasted']
+    return best_explosive, min_cost, best_holes, pred_frags
 
-# --- Train Models ---
-if not data.empty:
-    X = data[features]
-    y = data[targets]
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-    preprocessor = ColumnTransformer([('num', StandardScaler(), features)])
-    pipelines = {}
-    results = {}
-    param_grid = {
-        'rf__n_estimators': [100, 200],
-        'rf__max_depth': [10, None],
-        'rf__min_samples_split': [2, 5],
-        'rf__min_samples_leaf': [1, 2]
+def optimize_fragmentation(row, model, features):
+    burden_range = np.linspace(row['burden'] * 0.5, row['burden'] * 1.5, 10)
+    spacing_range = np.linspace(row['spacing'] * 0.5, row['spacing'] * 1.5, 10)
+    explosive_range = np.linspace(row['total_explosive_kg'] * 0.5, row['total_explosive_kg'] * 1.5, 10)
+    hole_depth_range = np.linspace(row['hole_depth'] * 0.5, row['hole_depth'] * 1.5, 10)
+    max_frag = 0
+    best_params = {
+        'burden': row['burden'],
+        'spacing': row['spacing'],
+        'total_explosive_kg': row['total_explosive_kg'],
+        'hole_depth': row['hole_depth']
     }
+    pred_frags = []
+    for burden in burden_range:
+        for spacing in spacing_range:
+            for explosive in explosive_range:
+                for hole_depth in hole_depth_range:
+                    temp_row = row.copy()
+                    temp_row['burden'] = burden
+                    temp_row['spacing'] = spacing
+                    temp_row['total_explosive_kg'] = explosive
+                    temp_row['hole_depth'] = hole_depth
+                    temp_row['burden_spacing'] = burden * spacing
+                    temp_row['depth_to_bench'] = hole_depth / temp_row['bench_height']
+                    temp_row['explosive_per_hole'] = explosive / temp_row['holes_blasted']
+                    temp_row['x50'] = compute_x50(temp_row)
+                    temp_row['x80'] = temp_row['x50'] * (np.log(5)) ** (1 / 1.2)
+                    temp_row['drill_cost'] = hole_depth * temp_row['holes_blasted'] * 150
+                    temp_row['total_blast_cost'] = temp_row['drill_cost'] + temp_row['explosive_cost']
+                    pred_frag = model.predict(pd.DataFrame([temp_row[features]], columns=features))[0]
+                    pred_frags.append(pred_frag)
+                    if pred_frag > max_frag:
+                        max_frag = pred_frag
+                        best_params = {
+                            'burden': burden,
+                            'spacing': spacing,
+                            'total_explosive_kg': explosive,
+                            'hole_depth': hole_depth
+                        }
+    print(f"Index {row.name}: Fragmentation optimization - Predicted frags: {pred_frags}")
+    return max_frag, best_params, pred_frags
 
-    for target in targets:
-        pipeline = Pipeline([
-            ('preprocessor', preprocessor),
-            ('rf', RandomForestRegressor(random_state=42))
-        ])
-        grid = GridSearchCV(pipeline, param_grid, cv=5, scoring='r2', n_jobs=-1)
-        grid.fit(X_train, y_train[target])
-        best_model = grid.best_estimator_
-        pipelines[target] = best_model
-        joblib.dump(best_model, f'rf_model_{target}.joblib')
+def optimize_safety(row, model_ppv, model_frag, features, data):
+    explosive_range = np.linspace(row['total_explosive_kg'] * 0.5, row['total_explosive_kg'] * 1.5, 20)
+    holes_range = np.linspace(max(1, row['holes_blasted'] * 0.5), row['holes_blasted'] * 1.5, 10, dtype=int)
+    min_ppv = float('inf')
+    best_explosive = row['total_explosive_kg']
+    best_holes = row['holes_blasted']
+    pred_frags = []
+    pred_ppvs = []
+    for explosive in explosive_range:
+        for holes in holes_range:
+            temp_row = row.copy()
+            temp_row['total_explosive_kg'] = explosive
+            temp_row['holes_blasted'] = holes
+            temp_row['explosive_per_hole'] = explosive / holes if holes > 0 else 0
+            temp_row['x50'] = compute_x50(temp_row)
+            temp_row['x80'] = temp_row['x50'] * (np.log(5)) ** (1 / 1.2)
+            temp_row['drill_cost'] = temp_row['hole_depth'] * holes * 150
+            temp_row['total_blast_cost'] = temp_row['drill_cost'] + temp_row['explosive_cost']
+            pred_frag = model_frag.predict(pd.DataFrame([temp_row[features]], columns=features))[0]
+            pred_ppv = model_ppv.predict(pd.DataFrame([temp_row[features]], columns=features))[0]
+            pred_frags.append(pred_frag)
+            pred_ppvs.append(pred_ppv)
+            if pred_frag >= FRAG_THRESHOLD and pred_ppv < min_ppv:
+                min_ppv = pred_ppv
+                best_explosive = explosive
+                best_holes = holes
+    print(f"Index {row.name}: Safety optimization - Predicted frags: {pred_frags}, Predicted PPVs: {pred_ppvs}")
+    if min_ppv == float('inf'):
+        print(f"Warning: No solution found for safety optimization at index {row.name}")
+        min_ppv = data.loc[row.name, 'ppv'] if row.name in data.index else row['ppv'] if 'ppv' in row else float('inf')
+        best_holes = row['holes_blasted']
+    return min_ppv, best_explosive, best_holes, pred_frags, pred_ppvs
 
-        y_pred = best_model.predict(X_test)
-        results[target] = {
-            'test_r2': float(r2_score(y_test[target], y_pred)),
-            'test_mae': float(mean_absolute_error(y_test[target], y_pred)),
-            'y_test': y_test[target].tolist(),
-            'y_pred': y_pred.tolist()
-        }
-
-    # Summary calculations
-    summary = {
-        'avg_pred_frag': float(np.mean(results['frag_in_range']['y_pred'])),
-        'avg_actual_frag': float(np.mean(y_test['frag_in_range'])),
-        'avg_pred_oversize': float(np.mean(results['frag_over_size']['y_pred'])),
-        'avg_actual_oversize': float(np.mean(y_test['frag_over_size'])),
-        'avg_pred_ppv': float(np.expm1(np.mean(results['ppv']['y_pred']))),
-        'avg_actual_ppv': float(np.expm1(np.mean(y_test['ppv']))),
-        'avg_cost': float(data['cost'].mean() / 1000),
-        'cost_savings': float(data['cost_savings'].mean() / 1000),
-        'unsafe_blasts': unsafe_count,
-        'optimized_avg_cost': float(data['optimized_cost'].mean() / 1000),
-        'optimized_avg_frag': float(np.mean(results['frag_in_range']['y_pred'])),
-        'optimized_avg_ppv': float(np.expm1(np.mean(results['ppv']['y_pred'])))
+def analyze_parameter_impact(row, model_frag, model_ppv, features):
+    parameters = ['burden', 'spacing', 'hole_depth', 'total_explosive_kg', 'holes_blasted']
+    ranges = {
+        'burden': np.linspace(row['burden'] * 0.5, row['burden'] * 1.5, 10),
+        'spacing': np.linspace(row['spacing'] * 0.5, row['spacing'] * 1.5, 10),
+        'hole_depth': np.linspace(row['hole_depth'] * 0.5, row['hole_depth'] * 1.5, 10),
+        'total_explosive_kg': np.linspace(row['total_explosive_kg'] * 0.5, row['total_explosive_kg'] * 1.5, 10),
+        'holes_blasted': np.linspace(max(1, row['holes_blasted'] * 0.5), row['holes_blasted'] * 1.5, 5, dtype=int)
     }
-else:
-    pipelines = {}
-    results = {target: {'test_r2': 0.0, 'test_mae': 0.0, 'y_test': [], 'y_pred': []} for target in targets}
-    summary = {key: 0.0 for key in [
-        'avg_pred_frag', 'avg_actual_frag', 'avg_pred_oversize', 'avg_actual_oversize',
-        'avg_pred_ppv', 'avg_actual_ppv', 'avg_cost', 'cost_savings',
-        'optimized_avg_cost', 'optimized_avg_frag', 'optimized_avg_ppv'
-    ]}
-    summary['unsafe_blasts'] = 0
+    impact_data = {param: {'frag': [], 'ppv': [], 'cost': []} for param in parameters}
+    for param in parameters:
+        for value in ranges[param]:
+            temp_row = row.copy()
+            temp_row[param] = value
+            if param in ['burden', 'spacing']:
+                temp_row['burden_spacing'] = temp_row['burden'] * temp_row['spacing']
+            if param == 'hole_depth':
+                temp_row['depth_to_bench'] = temp_row['hole_depth'] / temp_row['bench_height']
+                temp_row['drill_cost'] = temp_row['hole_depth'] * temp_row['holes_blasted'] * 150
+                temp_row['total_blast_cost'] = temp_row['drill_cost'] + temp_row['explosive_cost']
+            if param == 'total_explosive_kg':
+                temp_row['explosive_per_hole'] = temp_row['total_explosive_kg'] / temp_row['holes_blasted']
+                temp_row['explosive_cost'] = temp_row['total_explosive_kg'] * 100
+                temp_row['total_blast_cost'] = temp_row['drill_cost'] + temp_row['explosive_cost']
+            if param == 'holes_blasted':
+                temp_row['explosive_per_hole'] = temp_row['total_explosive_kg'] / temp_row['holes_blasted']
+                temp_row['drill_cost'] = temp_row['hole_depth'] * temp_row['holes_blasted'] * 150
+                temp_row['total_blast_cost'] = temp_row['drill_cost'] + temp_row['explosive_cost']
+            temp_row['x50'] = compute_x50(temp_row)
+            temp_row['x80'] = temp_row['x50'] * (np.log(5)) ** (1 / 1.2)
+            pred_frag = model_frag.predict(pd.DataFrame([temp_row[features]], columns=features))[0]
+            pred_ppv = np.expm1(model_ppv.predict(pd.DataFrame([temp_row[features]], columns=features))[0])
+            impact_data[param]['frag'].append(pred_frag)
+            impact_data[param]['ppv'].append(pred_ppv)
+            impact_data[param]['cost'].append(temp_row['total_blast_cost'])
+    return impact_data, ranges
 
+def clean_plot_directory():
+    plot_dir = 'plots'
+    for plot_file in glob.glob(f'{plot_dir}/dynamic_*.png'):
+        os.remove(plot_file)
 
-def generate_charts(predictions, input_data, timestamp):
-    charts = []
-    static_dir = 'static'
-    os.makedirs(static_dir, exist_ok=True)
+def generate_dynamic_plots(input_df, pred_frag_in_range, pred_ppv, opt_frag, opt_ppv, opt_holes, actual_holes, impact_data, ranges):
+    plt.style.use('default')
+    sns.set_style('whitegrid')
+    plot_dir = 'plots'
+    os.makedirs(plot_dir, exist_ok=True)
+    plot_files = []
+    timestamp = int(time.time())
 
-    # Clean up old charts
-    old_files = glob.glob(os.path.join(static_dir, 'chart_*_*.png'))
-    if len(old_files) > 10:
-        for f in sorted(old_files, key=os.path.getmtime)[:-10]:
-            os.remove(f)
-
-    # Chart 1: Actual vs Predicted Fragmentation In Range
+    # Plot 1: Current vs Optimized
     plt.figure(figsize=(8, 6))
-    sns.scatterplot(x=[input_data.get('frag_in_range', 0)], y=[predictions['frag_in_range']], alpha=0.6)
-    plt.plot([0, 100], [0, 100], 'r--')
-    plt.xlabel('Input Fragmentation In Range (%)')
-    plt.ylabel('Predicted Fragmentation In Range (%)')
-    plt.title('Actual vs Predicted Fragmentation In Range')
-    filename = f'chart_frag_in_range_{timestamp}.png'
-    plt.savefig(os.path.join(static_dir, filename))
-    plt.close()
-    charts.append(filename)
-
-    # Chart 2: Actual vs Predicted Costing
-    input_cost = input_data.get('total_blast_cost', 0)
-    optimized_cost = input_data.get('total_explosive_kg', 0) * 95
-    plt.figure(figsize=(8, 6))
-    sns.barplot(x=['Input', 'Predicted'], y=[input_cost / 1000, optimized_cost / 1000])
-    plt.xlabel('Cost Type')
-    plt.ylabel('Cost (₹1000)')
-    plt.title('Actual vs Predicted Costing')
-    filename = f'chart_costing_{timestamp}.png'
-    plt.savefig(os.path.join(static_dir, filename))
-    plt.close()
-    charts.append(filename)
-
-    # Chart 3: Actual vs Predicted PPV Safety
-    plt.figure(figsize=(8, 6))
-    sns.scatterplot(x=[np.expm1(input_data.get('ppv', 0))], y=[np.expm1(predictions['ppv'])], alpha=0.6)
-    max_val = max(np.expm1(input_data.get('ppv', 0)), np.expm1(predictions['ppv'])) * 1.1
-    plt.plot([0, max_val], [0, max_val], 'r--')
-    plt.xlabel('Input PPV (mm/s)')
-    plt.ylabel('Predicted PPV (mm/s)')
-    plt.title('Actual vs Predicted PPV Safety')
-    filename = f'chart_ppv_safety_{timestamp}.png'
-    plt.savefig(os.path.join(static_dir, filename))
-    plt.close()
-    charts.append(filename)
-
-    # Chart 4: Sample Index (Single Prediction)
-    plt.figure(figsize=(8, 6))
-    sns.scatterplot(x=[1], y=[predictions['frag_in_range']], label='Predicted')
-    if 'frag_in_range' in input_data:
-        sns.scatterplot(x=[1], y=[input_data['frag_in_range']], label='Input')
-    plt.xlabel('Sample Index')
-    plt.ylabel('Fragmentation In Range (%)')
-    plt.title('Fragmentation In Range vs Sample Index')
+    sns.scatterplot(x=[pred_frag_in_range], y=[pred_ppv], s=100, alpha=0.8, label='Current')
+    sns.scatterplot(x=[opt_frag], y=[opt_ppv], s=100, alpha=0.8, label='Optimized')
+    plt.xlabel('Fragmentation In Range (%)')
+    plt.ylabel('PPV (mm/s)')
+    plt.title('Current vs Optimized Results')
     plt.legend()
-    filename = f'chart_sample_index_{timestamp}.png'
-    plt.savefig(os.path.join(static_dir, filename))
+    plot_path = f'{plot_dir}/dynamic_prediction_plot_{timestamp}.png'
+    plt.savefig(plot_path, bbox_inches='tight')
     plt.close()
-    charts.append(filename)
+    plot_files.append(plot_path)
 
-    # Chart 5: Correlation Heatmap
-    plt.figure(figsize=(10, 8))
-    input_df = pd.DataFrame([input_data])
-    numeric_cols = ['burden', 'spacing', 'total_explosive_kg', 'frag_in_range', 'ppv']
-    input_df['ppv'] = np.expm1(input_df.get('ppv', 0))
-    input_df['frag_in_range'] = predictions['frag_in_range'] if 'frag_in_range' not in input_data else input_data[
-        'frag_in_range']
-    input_df = input_df[numeric_cols].fillna(0)
-    corr_matrix = input_df.corr()
-    sns.heatmap(corr_matrix, cmap='coolwarm', center=0, annot=True, fmt='.2f', annot_kws={'size': 12})
-    plt.title('Correlation Heatmap for Input Parameters')
-    filename = f'chart_heatmap_{timestamp}.png'
-    plt.savefig(os.path.join(static_dir, filename))
+    # Plot 2: Actual vs Optimized Number of Holes
+    plt.figure(figsize=(8, 6))
+    sns.barplot(x=['Actual', 'Optimized'], y=[actual_holes, opt_holes])
+    plt.xlabel('Blast Configuration')
+    plt.ylabel('Number of Holes')
+    plt.title('Actual vs Optimized Number of Holes')
+    plot_path = f'{plot_dir}/dynamic_holes_plot_{timestamp}.png'
+    plt.savefig(plot_path, bbox_inches='tight')
     plt.close()
-    charts.append(filename)
+    plot_files.append(plot_path)
 
-    return charts
+    # Plot 3: Parameter Impact Analysis
+    plt.figure(figsize=(15, 10))
+    parameters = ['burden', 'spacing', 'hole_depth', 'total_explosive_kg', 'holes_blasted']
+    for i, param in enumerate(parameters, 1):
+        plt.subplot(3, 2, i)
+        plt.plot(ranges[param], impact_data[param]['frag'], label='Fragmentation (%)', color='blue')
+        plt.plot(ranges[param], impact_data[param]['ppv'], label='PPV (mm/s)', color='orange')
+        plt.plot(ranges[param], np.array(impact_data[param]['cost']) / 1000, label='Cost (₹1000)', color='green')
+        plt.xlabel(param.replace('_', ' ').title())
+        plt.title(f'Impact of {param.replace("_", " ").title()}')
+        plt.legend()
+        plt.grid(True)
+    plt.tight_layout()
+    plot_path = f'{plot_dir}/dynamic_impact_plot_{timestamp}.png'
+    plt.savefig(plot_path, bbox_inches='tight')
+    plt.close()
+    plot_files.append(plot_path)
 
+    return plot_files
 
-@app.route('/api/summary', methods=['GET'])
-def get_summary():
-    try:
-        initial_charts = [
-            'fragmentation_in_range.png',
-            'fragmentation_over_size.png',
-            'ppv_plot.png',
-            'cost_plot.png',
-            'safety_plot.png',
-            'correlation_heatmap.png',
-            'optimization_results.png',
-            'frag_in_range_vs_index.png',
-            'frag_out_of_range_vs_log10.png',
-            'frag_in_range_actual_vs_predicted.png'
-        ]
-        return jsonify({
-            'summary': summary,
-            'results': {k: {sk: float(sv) if isinstance(sv, (np.floating, np.integer)) else sv for sk, sv in v.items()}
-                        for k, v in results.items()},
-            'unsafe_count': unsafe_count,
-            'charts': initial_charts if not data.empty and all(
-                os.path.exists(os.path.join('static', f)) for f in initial_charts) else []
-        })
-    except Exception as e:
-        print(f"Error in get_summary: {str(e)}")
-        return jsonify({'error': f'Failed to fetch summary: {str(e)}'}), 500
+def generate_static_plots(results, data, X_test_indices, optimized_costs, optimized_frags, optimized_ppvs, optimized_holes):
+    plt.style.use('default')
+    sns.set_style('whitegrid')
+    plot_dir = 'plots'
+    os.makedirs(plot_dir, exist_ok=True)
+    plot_files = []
 
+    # Plot 1: Actual vs Predicted frag_in_range
+    plt.figure(figsize=(8, 6))
+    sns.scatterplot(x=results['frag_in_range']['y_test'], y=results['frag_in_range']['y_pred'], alpha=0.6)
+    plt.plot([results['frag_in_range']['y_test'].min(), results['frag_in_range']['y_test'].max()],
+             [results['frag_in_range']['y_test'].min(), results['frag_in_range']['y_test'].max()], 'r--')
+    plt.xlabel('Actual Fragmentation In Range (%)')
+    plt.ylabel('Predicted Fragmentation In Range (%)')
+    plt.title(f'Fragmentation In Range: R²={results["frag_in_range"]["test_r2"]:.2f}')
+    plot_path = f'{plot_dir}/fragmentation_in_range.png'
+    plt.savefig(plot_path, bbox_inches='tight')
+    plt.close()
+    plot_files.append(plot_path)
 
-@app.route('/api/predict', methods=['POST'])
-def predict():
-    try:
-        input_data = request.json
-        if not input_data:
-            return jsonify({'error': 'No input data provided'}), 400
+    # Plot 2: Actual vs Predicted frag_over_size
+    plt.figure(figsize=(8, 6))
+    sns.scatterplot(x=results['frag_over_size']['y_test'], y=results['frag_over_size']['y_pred'], alpha=0.6)
+    plt.plot([results['frag_over_size']['y_test'].min(), results['frag_over_size']['y_test'].max()],
+             [results['frag_over_size']['y_test'].min(), results['frag_over_size']['y_test'].max()], 'r--')
+    plt.xlabel('Actual Fragmentation Over Size (%)')
+    plt.ylabel('Predicted Fragmentation Over Size (%)')
+    plt.title(f'Fragmentation Over Size: R²={results["frag_over_size"]["test_r2"]:.2f}')
+    plot_path = f'{plot_dir}/fragmentation_over_size.png'
+    plt.savefig(plot_path, bbox_inches='tight')
+    plt.close()
+    plot_files.append(plot_path)
 
-        # Create DataFrame with input data
-        df = pd.DataFrame([input_data])
+    # Plot 3: Actual vs Predicted PPV
+    plt.figure(figsize=(8, 6))
+    sns.scatterplot(x=np.expm1(results['ppv']['y_test']), y=np.expm1(results['ppv']['y_pred']), alpha=0.6)
+    plt.plot([np.expm1(results['ppv']['y_test']).min(), np.expm1(results['ppv']['y_test']).max()],
+             [np.expm1(results['ppv']['y_test']).min(), np.expm1(results['ppv']['y_test']).max()], 'r--')
+    plt.xlabel('Actual PPV (mm/s)')
+    plt.ylabel('Predicted PPV (mm/s)')
+    plt.title(f'PPV: R²={results["ppv"]["test_r2"]:.2f}')
+    plot_path = f'{plot_dir}/ppv_plot.png'
+    plt.savefig(plot_path, bbox_inches='tight')
+    plt.close()
+    plot_files.append(plot_path)
 
-        # Feature engineering
-        df['burden_spacing'] = df['burden'] * df['spacing']
-        df['depth_to_bench'] = df['hole_depth'] / df['bench_height']
-        df['explosive_per_hole'] = df['total_explosive_kg'] / df['hole_blasted']
-        df['x50'] = df.apply(compute_x50, axis=1)
-        df['x80'] = df['x50'] * (np.log(5)) ** (1 / 1.2)
-        df['frag_out_of_range'] = df.get('frag_over_size', 0) + (
-                    100 - df.get('frag_in_range', 0) - df.get('frag_over_size', 0))
-        df['drill_cost'] = df['hole_depth'] * df['hole_blasted'] * 150
-        df['explosive_cost'] = df['total_explosive_kg'] * 100
-        df['total_blast_cost'] = df['drill_cost'] + df['explosive_cost']
-        df['ppv_alert'] = (df.get('ppv', 0) > np.log1p(5)).astype(int)
-
-        # Ensure all features are present
-        for feature in features:
-            if feature not in df.columns:
-                df[feature] = 0
-
-        # Predictions
-        if not pipelines:
-            return jsonify({'error': 'Models not loaded. Ensure training data is available.'}), 500
-
-        predictions = {}
-        for target in targets:
-            pred = pipelines[target].predict(df[features])[0]
-            predictions[target] = float(pred)
-
-        # Update summary
-        updated_summary = {
-            'avg_pred_frag': float(predictions['frag_in_range']),
-            'avg_actual_frag': float(input_data.get('frag_in_range', summary['avg_actual_frag'])),
-            'avg_pred_oversize': float(predictions['frag_over_size']),
-            'avg_actual_oversize': float(input_data.get('frag_over_size', summary['avg_actual_oversize'])),
-            'avg_pred_ppv': float(np.expm1(predictions['ppv'])),
-            'avg_actual_ppv': float(np.expm1(input_data.get('ppv', np.log1p(summary['avg_actual_ppv'])))),
-            'avg_cost': float(df['total_blast_cost'].iloc[0] / 1000),
-            'cost_savings': float((df['total_blast_cost'].iloc[0] - df['total_explosive_kg'].iloc[0] * 95) / 1000),
-            'unsafe_blasts': int(predictions['ppv'] > np.log1p(10)),
-            'optimized_avg_cost': float(df['total_explosive_kg'].iloc[0] * 95 / 1000),
-            'optimized_avg_frag': float(predictions['frag_in_range']),
-            'optimized_avg_ppv': float(np.expm1(predictions['ppv']))
-        }
-
-        # Generate dynamic charts
-        timestamp = int(time.time())
-        charts = generate_charts(predictions, input_data, timestamp)
-
-        return jsonify({
-            'summary': updated_summary,
-            'results': results,
-            'charts': charts
-        })
-    except Exception as e:
-        print(f"Error in predict: {str(e)}")
-        return jsonify({'error': f'Prediction failed: {str(e)}'}), 500
-
-
-@app.route('/static/<path:filename>')
-def serve_static(filename):
-    try:
-        return send_from_directory('static', filename)
-    except FileNotFoundError:
-        return jsonify({'error': 'Chart not found'}), 404
-
-
-if __name__ == '__main__':
-    # Generate initial charts
-    if not data.empty:
-        static_dir = 'static'
-        os.makedirs(static_dir, exist_ok=True)
-
-        # Plot 1: Actual vs Predicted Fragmentation In Range
+    # Plot 4: Actual vs Optimized Cost
+    if len(optimized_costs) == len(X_test_indices):
         plt.figure(figsize=(8, 6))
-        sns.scatterplot(x=results['frag_in_range']['y_test'], y=results['frag_in_range']['y_pred'], alpha=0.6)
-        plt.plot([min(results['frag_in_range']['y_test']), max(results['frag_in_range']['y_test'])],
-                 [min(results['frag_in_range']['y_test']), max(results['frag_in_range']['y_test'])], 'r--')
-        plt.xlabel('Actual Fragmentation In Range (%)')
-        plt.ylabel('Predicted Fragmentation In Range (%)')
-        plt.title(f'Fragmentation In Range: R²={results["frag_in_range"]["test_r2"]:.2f}')
-        plt.savefig(os.path.join(static_dir, 'fragmentation_in_range.png'))
-        plt.close()
-
-        # Plot 2: Actual vs Predicted Fragmentation Over Size
-        plt.figure(figsize=(8, 6))
-        sns.scatterplot(x=results['frag_over_size']['y_test'], y=results['frag_over_size']['y_pred'], alpha=0.6)
-        plt.plot([min(results['frag_over_size']['y_test']), max(results['frag_over_size']['y_test'])],
-                 [min(results['frag_over_size']['y_test']), max(results['frag_over_size']['y_test'])], 'r--')
-        plt.xlabel('Actual Fragmentation Over Size (%)')
-        plt.ylabel('Predicted Fragmentation Over Size (%)')
-        plt.title(f'Fragmentation Over Size: R²={results["frag_over_size"]["test_r2"]:.2f}')
-        plt.savefig(os.path.join(static_dir, 'fragmentation_over_size.png'))
-        plt.close()
-
-        # Plot 3: Actual vs Predicted PPV
-        plt.figure(figsize=(8, 6))
-        sns.scatterplot(x=np.expm1(results['ppv']['y_test']), y=np.expm1(results['ppv']['y_pred']), alpha=0.6)
-        plt.plot([min(np.expm1(results['ppv']['y_test'])), max(np.expm1(results['ppv']['y_test']))],
-                 [min(np.expm1(results['ppv']['y_test'])), max(np.expm1(results['ppv']['y_test']))], 'r--')
-        plt.xlabel('Actual PPV (mm/s)')
-        plt.ylabel('Predicted PPV (mm/s)')
-        plt.title(f'PPV: R²={results["ppv"]["test_r2"]:.2f}')
-        plt.savefig(os.path.join(static_dir, 'ppv_plot.png'))
-        plt.close()
-
-        # Plot 4: Actual vs Optimized Cost
-        plt.figure(figsize=(8, 6))
-        sns.scatterplot(x=data.loc[X_test.index, 'total_blast_cost'], y=data.loc[X_test.index, 'optimized_cost'],
-                        alpha=0.6)
+        sns.scatterplot(x=data.loc[X_test_indices, 'total_blast_cost'], y=optimized_costs, alpha=0.6)
         plt.plot([data['total_blast_cost'].min(), data['total_blast_cost'].max()],
                  [data['total_blast_cost'].min(), data['total_blast_cost'].max()], 'r--')
         plt.xlabel('Actual Total Blast Cost (₹)')
         plt.ylabel('Optimized Total Blast Cost (₹)')
         plt.title('Actual vs Optimized Cost')
-        plt.savefig(os.path.join(static_dir, 'cost_plot.png'))
+        plot_path = f'{plot_dir}/cost_plot.png'
+        plt.savefig(plot_path, bbox_inches='tight')
         plt.close()
+        plot_files.append(plot_path)
 
-        # Plot 5: Safety (Confusion Matrix for PPV Alert)
-        plt.figure(figsize=(8, 6))
-        y_pred_ppv_alert = (np.array(results['ppv']['y_pred']) > np.log1p(5)).astype(int)
-        from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+    # Plot 5: Safety (Confusion Matrix for ppv_alert)
+    plt.figure(figsize=(8, 6))
+    y_pred_ppv_alert = (results['ppv']['y_pred'] > GROUND_VIBRATION_LIMIT).astype(int)
+    cm = ConfusionMatrixDisplay.from_predictions(
+        data.loc[X_test_indices, 'ppv_alert'], y_pred_ppv_alert, display_labels=['Safe', 'Danger']
+    )
+    cm.plot(ax=plt.gca(), cmap='Blues')
+    plt.title('Safety: Actual vs Predicted PPV Alert')
+    plot_path = f'{plot_dir}/safety_plot.png'
+    plt.savefig(plot_path, bbox_inches='tight')
+    plt.close()
+    plot_files.append(plot_path)
 
-        cm = confusion_matrix(data.loc[X_test.index, 'ppv_alert'], y_pred_ppv_alert)
-        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Safe', 'Danger'])
-        disp.plot(cmap='Blues')
-        plt.title('Safety: Actual vs Predicted PPV Alert')
-        plt.savefig(os.path.join(static_dir, 'safety_plot.png'))
-        plt.close()
+    # Plot 6: Correlation Heatmap
+    plt.figure(figsize=(10, 8))
+    numeric_cols = ['burden', 'spacing', 'hole_depth', 'total_explosive_kg', 'holes_blasted', 'frag_in_range', 'ppv']
+    corr_matrix = data[numeric_cols].corr()
+    sns.heatmap(corr_matrix, cmap='coolwarm', center=0, annot=True, fmt='.2f')
+    plt.title('Correlation Heatmap')
+    plot_path = f'{plot_dir}/correlation_heatmap.png'
+    plt.savefig(plot_path, bbox_inches='tight')
+    plt.close()
+    plot_files.append(plot_path)
 
-        # Plot 6: Correlation Heatmap
-        plt.figure(figsize=(10, 8))
-        numeric_cols = ['burden', 'spacing', 'total_explosive_kg', 'frag_in_range', 'ppv']
-        corr_matrix = data[numeric_cols].corr()
-        sns.heatmap(corr_matrix, cmap='coolwarm', center=0, annot=True, fmt='.2f', annot_kws={'size': 12})
-        plt.title('Correlation Heatmap')
-        plt.savefig(os.path.join(static_dir, 'correlation_heatmap.png'))
-        plt.close()
-
-        # Plot 7: Optimization Results
+    # Plot 7: Optimization Results
+    if len(optimized_costs) == len(X_test_indices):
         plt.figure(figsize=(15, 5))
         plt.subplot(1, 3, 1)
-        sns.barplot(x=['Baseline', 'Optimized'], y=[data.loc[X_test.index, 'total_blast_cost'].mean() / 1000,
-                                                    data.loc[X_test.index, 'optimized_cost'].mean() / 1000])
+        sns.barplot(x=['Baseline', 'Optimized'],
+                    y=[data.loc[X_test_indices, 'total_blast_cost'].mean() / 1000, np.mean(optimized_costs) / 1000])
         plt.title('Average Cost (₹1000)')
         plt.subplot(1, 3, 2)
         sns.barplot(x=['Baseline', 'Optimized'],
-                    y=[np.mean(results['frag_in_range']['y_test']), np.mean(results['frag_in_range']['y_pred'])])
+                    y=[results['frag_in_range']['y_test'].mean(), np.mean(optimized_frags)])
         plt.title('Average Fragmentation In Range (%)')
         plt.subplot(1, 3, 3)
         sns.barplot(x=['Baseline', 'Optimized'],
-                    y=[np.expm1(np.mean(results['ppv']['y_test'])), np.expm1(np.mean(results['ppv']['y_pred']))])
+                    y=[np.expm1(results['ppv']['y_test']).mean(), np.expm1(np.mean(optimized_ppvs))])
         plt.title('Average PPV (mm/s)')
-        plt.savefig(os.path.join(static_dir, 'optimization_results.png'))
+        plt.tight_layout()
+        plot_path = f'{plot_dir}/optimization_results.png'
+        plt.savefig(plot_path, bbox_inches='tight')
         plt.close()
+        plot_files.append(plot_path)
 
-        # Plot 8: Actual Frag In Range vs Sample Index
+    # Plot 8: Actual vs Optimized Number of Holes
+    if len(optimized_holes) == len(X_test_indices):
         plt.figure(figsize=(8, 6))
-        sns.lineplot(x=range(len(results['frag_in_range']['y_test'])), y=results['frag_in_range']['y_test'])
-        plt.xlabel('Sample Index')
-        plt.ylabel('Actual Fragmentation In Range (%)')
-        plt.title('Actual Fragmentation In Range vs Sample Index')
-        plt.savefig(os.path.join(static_dir, 'frag_in_range_vs_index.png'))
+        sns.scatterplot(x=data.loc[X_test_indices, 'holes_blasted'], y=optimized_holes, alpha=0.6)
+        plt.plot([data['holes_blasted'].min(), data['holes_blasted'].max()],
+                 [data['holes_blasted'].min(), data['holes_blasted'].max()], 'r--')
+        plt.xlabel('Actual Number of Holes')
+        plt.ylabel('Optimized Number of Holes')
+        plt.title('Actual vs Optimized Number of Holes')
+        plot_path = f'{plot_dir}/holes_plot.png'
+        plt.savefig(plot_path, bbox_inches='tight')
         plt.close()
+        plot_files.append(plot_path)
 
-        # Plot 9: Actual Frag Out of Range vs Log10(x50)
-        plt.figure(figsize=(8, 6))
-        sns.scatterplot(x=np.log10(data.loc[X_test.index, 'x50']), y=data.loc[X_test.index, 'frag_out_of_range'],
-                        alpha=0.6)
-        plt.xlabel('Log10(x50) (Fragment Size)')
-        plt.ylabel('Actual Fragmentation Out of Range (%)')
-        plt.title('Fragmentation Out of Range vs Log10(x50)')
-        plt.savefig(os.path.join(static_dir, 'frag_out_of_range_vs_log10.png'))
-        plt.close()
+    return plot_files
 
-        # Plot 10: Actual vs Predicted Frag In Range vs Sample Index
-        plt.figure(figsize=(8, 6))
-        sns.lineplot(x=range(len(results['frag_in_range']['y_test'])), y=results['frag_in_range']['y_test'],
-                     label='Actual')
-        sns.lineplot(x=range(len(results['frag_in_range']['y_pred'])), y=results['frag_in_range']['y_pred'],
-                     label='Predicted')
-        plt.xlabel('Sample Index')
-        plt.ylabel('Fragmentation In Range (%)')
-        plt.title('Actual vs Predicted Fragmentation In Range vs Sample Index')
-        plt.legend()
-        plt.savefig(os.path.join(static_dir, 'frag_in_range_actual_vs_predicted.png'))
-        plt.close()
+# Generate static plots
+plot_urls = generate_static_plots(results, data, X_test_indices, optimized_costs, optimized_frags, optimized_ppvs, optimized_holes)
 
-    app.run(debug=True, port=5000)  
+@app.route('/api/optimize', methods=['POST', 'OPTIONS'])
+def optimize():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    try:
+        start_time = time.time()
+        data = request.get_json()
+        if not data or 'parameters' not in data:
+            return jsonify({'error': 'No input parameters provided'}), 400
+
+        input_data = data['parameters']
+        input_df = pd.DataFrame([input_data])
+        input_df.columns = input_df.columns.str.strip().str.lower().str.replace(" ", "_")
+
+        # Convert inputs to numeric
+        for col in input_df.columns:
+            input_df[col] = pd.to_numeric(input_df[col], errors='coerce')
+
+        # Check for missing or invalid inputs
+        required_inputs = [
+            'burden', 'hole_diameter', 'spacing', 'hole_depth', 'stemming_length',
+            'bench_height', 'hole_angle', 'total_rows', 'holes_blasted',
+            'column_charge_density', 'avg_column_charge_length', 'avg_column_weight',
+            'total_explosive_kg', 'rock_density'
+        ]
+        missing_cols = [col for col in required_inputs if col not in input_df.columns or input_df[col].isna().any()]
+        if missing_cols:
+            return jsonify({'error': f'Missing or invalid inputs: {missing_cols}'}), 400
+
+        # Handle zero hole_angle
+        if input_df['hole_angle'].iloc[0] == 0:
+            print("Warning: hole_angle is zero, using small non-zero value for stability")
+            input_df['hole_angle'] = input_df['hole_angle'].replace(0, 1e-10)
+
+        # Feature engineering
+        input_df['burden_spacing'] = input_df['burden'] * input_df['spacing']
+        input_df['depth_to_bench'] = input_df['hole_depth'] / input_df['bench_height']
+        input_df['explosive_per_hole'] = input_df['total_explosive_kg'] / input_df['holes_blasted']
+        input_df['x50'] = input_df.apply(compute_x50, axis=1)
+        input_df['x80'] = input_df['x50'] * (np.log(5)) ** (1 / 1.2)
+        input_df['frag_out_of_range'] = 0
+        input_df['drill_cost'] = input_df['hole_depth'] * input_df['holes_blasted'] * 150
+        input_df['explosive_cost'] = input_df['total_explosive_kg'] * 100
+        input_df['total_blast_cost'] = input_df['drill_cost'] + input_df['explosive_cost']
+        input_df['ppv_alert'] = 0
+
+        # Ensure all features
+        missing_features = [col for col in features if col not in input_df.columns]
+        if missing_features:
+            return jsonify({'error': f'Missing features: {missing_features}'}), 400
+
+        X = input_df[features]
+        optimization_type = data.get('optimization_type', 'cost')
+
+        # Predict
+        pred_frag_in_range = pipelines['frag_in_range'].predict(X)[0]
+        pred_frag_over_size = pipelines['frag_over_size'].predict(X)[0]
+        pred_ppv = np.expm1(pipelines['ppv'].predict(X)[0])
+        actual_holes = input_df['holes_blasted'].iloc[0]
+
+        # Apply optimization
+        row = input_df.iloc[0].copy()
+        row.name = 0
+        if optimization_type == 'cost':
+            best_explosive, opt_cost, opt_holes, _ = optimize_cost(row, pipelines['frag_in_range'], features, input_df)
+            opt_frag = pred_frag_in_range
+            opt_ppv = pred_ppv
+            best_params = {
+                'burden': row['burden'],
+                'spacing': row['spacing'],
+                'hole_depth': row['hole_depth'],
+                'total_explosive_kg': best_explosive,
+                'holes_blasted': opt_holes
+            }
+        elif optimization_type == 'fragmentation':
+            opt_frag, best_params, _ = optimize_fragmentation(row, pipelines['frag_in_range'], features)
+            opt_cost = input_df['total_blast_cost'].iloc[0]
+            opt_ppv = pred_ppv
+            opt_holes = row['holes_blasted']
+        else:  # safety
+            opt_ppv, best_explosive, opt_holes, _, _ = optimize_safety(row, pipelines['ppv'], pipelines['frag_in_range'], features, input_df)
+            opt_cost = input_df['total_blast_cost'].iloc[0]
+            opt_frag = pred_frag_in_range
+            best_params = {
+                'burden': row['burden'],
+                'spacing': row['spacing'],
+                'hole_depth': row['hole_depth'],
+                'total_explosive_kg': best_explosive,
+                'holes_blasted': opt_holes
+            }
+
+        # Parameter impact analysis
+        impact_data, ranges = analyze_parameter_impact(row, pipelines['frag_in_range'], pipelines['ppv'], features)
+
+        # Clean old dynamic plots
+        clean_plot_directory()
+
+        # Generate dynamic plots
+        dynamic_plot_urls = generate_dynamic_plots(input_df, pred_frag_in_range, pred_ppv, opt_frag, opt_ppv, opt_holes, actual_holes, impact_data, ranges)
+
+        # Count unsafe blasts
+        unsafe_blasts = 1 if pred_ppv > 5 else 0
+        optimized_unsafe_blasts = 1 if opt_ppv > 5 else 0
+
+        # Prepare response
+        response = {
+            'current': {
+                'predictions': {
+                    'frag_in_range': float(pred_frag_in_range),
+                    'frag_over_size': float(pred_frag_over_size),
+                    'ppv': float(pred_ppv)
+                },
+                'engineered': {
+                    'total_blast_cost': float(input_df['total_blast_cost'].iloc[0]),
+                    'burden_spacing': float(input_df['burden_spacing'].iloc[0]),
+                    'explosive_per_hole': float(input_df['explosive_per_hole'].iloc[0]),
+                    'holes_blasted': float(actual_holes)
+                },
+                'safety_rating': 'Good' if pred_ppv <= 5 else 'Caution',
+                'unsafe_blasts': unsafe_blasts
+            },
+            'optimized': {
+                'predictions': {
+                    'frag_in_range': float(opt_frag),
+                    'ppv': float(opt_ppv)
+                },
+                'engineered': {
+                    'total_blast_cost': float(opt_cost),
+                    'burden': float(best_params['burden']),
+                    'spacing': float(best_params['spacing']),
+                    'hole_depth': float(best_params['hole_depth']),
+                    'total_explosive_kg': float(best_params['total_explosive_kg']),
+                    'holes_blasted': float(opt_holes)
+                },
+                'safety_rating': 'Excellent' if opt_ppv <= 5 else 'Good',
+                'unsafe_blasts': optimized_unsafe_blasts
+            },
+            'improvements': {
+                'cost_savings': float(input_df['total_blast_cost'].iloc[0] - opt_cost),
+                'cost_savings_percentage': float(
+                    (input_df['total_blast_cost'].iloc[0] - opt_cost) / input_df['total_blast_cost'].iloc[0] * 100) if
+                input_df['total_blast_cost'].iloc[0] != 0 else 0,
+                'fragmentation_improvement': float(opt_frag - pred_frag_in_range),
+                'safety_improvement': float(pred_ppv - opt_ppv),
+                'holes_reduction': float(actual_holes - opt_holes)
+            },
+            'recommendations': [
+                f'Adjust burden to {best_params["burden"]:.2f} m, spacing to {best_params["spacing"]:.2f} m, hole depth to {best_params["hole_depth"]:.2f} m, and explosive to {best_params["total_explosive_kg"]:.2f} kg for optimal results.',
+                f'Monitor PPV to ensure safety compliance (optimized PPV: {opt_ppv:.2f} mm/s).',
+                f'Optimize number of holes to {opt_holes:.0f} to reduce costs.'
+            ],
+            'plot_urls': [f'/plots/{os.path.basename(plot)}' for plot in plot_urls + dynamic_plot_urls],
+            'parameter_impact': {
+                param: {
+                    'values': ranges[param].tolist(),
+                    'fragmentation': impact_data[param]['frag'],
+                    'ppv': impact_data[param]['ppv'],
+                    'cost': impact_data[param]['cost']
+                } for param in impact_data
+            }
+        }
+
+        print(f"Request processed in {time.time() - start_time:.2f} seconds")
+        return jsonify(response), 200
+
+    except Exception as e:
+        print(f"Error in /api/optimize: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/plots/<path:filename>')
+def serve_plot(filename):
+    plot_path = os.path.join(os.getcwd(), 'plots', filename)
+    if os.path.exists(plot_path):
+        response = send_file(plot_path, mimetype='image/png')
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        return response
+    return jsonify({'error': 'Plot not found'}), 404
+
+if __name__ == '__main__':
+    print("Loaded pre-trained models and preprocessor")
+    app.run(host='0.0.0.0', port=5000, debug=False)  # Disable debug for better performance
