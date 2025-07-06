@@ -1,8 +1,19 @@
 import joblib
-import numpy as np
 from sklearn.ensemble import RandomForestRegressor
+import numpy as np
 
-model = RandomForestRegressor()
-model.fit([[1, 2], [3, 4]], [0, 1])  # Example training
+# Dummy train example — use your actual training data
+X = np.random.rand(100, 5)
+y = np.random.rand(100)
 
-joblib.dump(model, "rf_model_ppv.joblib")
+model1 = RandomForestRegressor().fit(X, y)
+model2 = RandomForestRegressor().fit(X, y)
+model3 = RandomForestRegressor().fit(X, y)
+
+# Save all models (replacing the existing ones)
+joblib.dump(model1, "rf_model_frag_in_range.joblib")
+joblib.dump(model2, "rf_model_frag_over_size.joblib")
+joblib.dump(model3, "rf_model_ppv.joblib")
+
+
+print("process done")
