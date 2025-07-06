@@ -1,4 +1,5 @@
-# render.yaml (exact name, in lowercase)
+# ✅ render.yaml (must start with this!)
+type: blueprint
 services:
   - type: web
     name: blast-api
